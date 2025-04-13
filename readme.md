@@ -1,6 +1,6 @@
-# 🏦 CurvanceTimeVault
+# 🏦 TimeVault
 
-**CurvanceTimeVault** is a yield-generating smart vault that accepts ERC20 deposits and issues NFTs as proof-of-deposit. Users can later reclaim their yield and initial stake by burning the NFTs. The system supports bribes, fees, compounding via ERC4626 strategies, and upgradability through UUPS proxy pattern.
+**TimeVault** is a yield-generating smart vault that accepts ERC20 deposits and issues NFTs as proof-of-deposit. Users can later reclaim their yield and initial stake by burning the NFTs. The system supports bribes, fees, compounding via ERC4626 strategies, and upgradability through UUPS proxy pattern.
 
 ---
 
@@ -18,7 +18,7 @@
 
 ## 🛠 Contracts Overview
 
-### `CurvanceTimeVault.sol`
+### `TimeVault.sol`
 
 Handles:
 - User deposits in ERC20
