@@ -162,7 +162,6 @@ function getState() public view returns (uint256)
 ## 👨‍💻 Author
 
 **MeowFi Labs** | 2025  
-🔗 Powered by Curvance, Fastlane, and OpenZeppelin
 
 ---
 
