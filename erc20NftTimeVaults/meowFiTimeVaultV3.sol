@@ -10,6 +10,8 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/token/ERC20/extensions/ERC4626.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "./uniswapHelper.sol";
+import "./IWrappedMonad.sol";
 
 // 0x7bde82f20000000000000000000000000000000000000000000000000000421515a234a800000000000000000000000053c02ddd9804e318472dbe5c4297834a7b80ba0e
 //Initializable, UUPSUpgradeable, OwnableUpgradeable, ReentrancyGuardUpgradeable
@@ -46,12 +48,28 @@ contract CurvanceTimeVault is Initializable, UUPSUpgradeable, OwnableUpgradeable
     mapping(address => uint256) public bribes;
     address[] public bribeTokenAddr;
     mapping(uint256 => bool) public nftClaimed;
+    IOctoswapRouter02 public router;
+    address payable public immutable WETH = payable(0x760AfE86e5de5fa0Ee542fc7B7B713e1c5425701);
 
     event FundsWithdrawn(address indexed receiver);
     event FeesCollected(uint256 amount);
     event ExternalFundsDeposited(uint256 amount);
     event VaultJoined(address indexed user, uint256 amount);
     event Compounded(uint256 amount);
+    event SwapExecuted(
+    address indexed user,
+    address indexed inputToken,
+    uint256 inputAmount,
+    address indexed outputToken,
+    uint256 outputAmount,
+    uint256 slippageBps
+);
+event EthSwapExecuted(
+    address indexed user,
+    uint256 ethAmount,
+    uint256 shmonAmount,
+    uint256 slippageBps
+);
 
     // constructor(
     //     uint256 _nftPrice,
@@ -87,7 +105,8 @@ contract CurvanceTimeVault is Initializable, UUPSUpgradeable, OwnableUpgradeable
         uint256 _claimingPeriod,
         address _PartnerContract,
         address _erc20Address,
-        uint256 _prejoinPeriod
+        uint256 _prejoinPeriod,
+        address _router
     ) public initializer {
         __Ownable_init(initialOwner);
         __UUPSUpgradeable_init();
@@ -104,6 +123,8 @@ contract CurvanceTimeVault is Initializable, UUPSUpgradeable, OwnableUpgradeable
         PartnerContract = _PartnerContract;
         erc20Address = _erc20Address;
         prejoinPeriod = _prejoinPeriod;
+        router = IOctoswapRouter02(_router);
+        
     }
     function _authorizeUpgrade(address newImplementation)
         internal
@@ -111,8 +132,10 @@ contract CurvanceTimeVault is Initializable, UUPSUpgradeable, OwnableUpgradeable
         onlyOwner
     {}
 
-    function joinVault(uint256 _nftAmount) public {
+    function joinVault(uint256 _nftAmount,address user) public {
         require(getState() == 0, "Waiting period");
+        require(user != address(0), "Invalid user");
+
         require(
             getNftCount() + _nftAmount <= TimeNft(nftAddress).nftLimit(),
             "Exceeds NFT limit"
@@ -122,9 +145,9 @@ contract CurvanceTimeVault is Initializable, UUPSUpgradeable, OwnableUpgradeable
         IERC20 erc20 = IERC20(erc20Address);
         uint256 amount = _nftAmount * nftPrice;
 
-        require(erc20.balanceOf(msg.sender) >= amount, "insuffBalance");
+        require(erc20.balanceOf(user) >= amount, "insuffBalance");
         require(
-            erc20.transferFrom(msg.sender, address(this), amount),
+            erc20.transferFrom(user, address(this), amount),
             "Transfer failed"
         );
         erc20.approve(PartnerContract, amount);
@@ -133,20 +156,176 @@ contract CurvanceTimeVault is Initializable, UUPSUpgradeable, OwnableUpgradeable
             abi.encodeWithSignature("mint(uint256)", amount)
         );
         require(success, string(data));
-
-        Vault storage userVault = vaults[msg.sender];
         require(
-            userVault.nftAmount + _nftAmount <= nftLimitPerAddress,
+            TimeNft(nftAddress).balanceOf(user) + _nftAmount <= nftLimitPerAddress,
             "Limit exceeded"
         );
 
-        TimeNft(nftAddress).safeMint(msg.sender, _nftAmount);
-        userVault.ethAmount += amount;
-        userVault.nftAmount += _nftAmount;
+        TimeNft(nftAddress).safeMint(user, _nftAmount);
         activeFunds += amount;
         totalFunds += amount;
 
-        emit VaultJoined(msg.sender, amount);
+        emit VaultJoined(user, amount);
+    }
+    function swapAndJoin(
+    uint256 _nftAmount,
+    address user,
+    uint16 _slippageBps,
+    address _startTokenAddr
+) external nonReentrant {
+    require(_nftAmount > 0, "Zero NFT amount");
+    require(user != address(0), "Invalid user");
+    require(_slippageBps <= 1000, "Slippage too high");
+    
+    uint256 exactShmonOut = _nftAmount * nftPrice;
+    uint256 maxAmountIn = getInputForExactOutput(_nftAmount, _slippageBps, _startTokenAddr);
+    
+    // Transfer and approve input tokens
+    IERC20(_startTokenAddr).transferFrom(msg.sender, address(this), maxAmountIn);
+    IERC20(_startTokenAddr).approve(address(router), maxAmountIn);
+    
+    // Execute swap to THIS contract
+    address[] memory path = new address[](3);
+    path[0] = _startTokenAddr;
+    path[1] = WETH;
+    path[2] = erc20Address;
+    
+    uint[] memory amounts = router.swapTokensForExactTokens(
+        exactShmonOut,
+        maxAmountIn,
+        path,
+        address(this), // Send SHMON to contract, not user
+        block.timestamp + 300
+    );
+    
+    // Refund unused input tokens
+    if (amounts[0] < maxAmountIn) {
+        IERC20(_startTokenAddr).transfer(user, maxAmountIn - amounts[0]);
+    }
+    
+    // Internal join without token transfer
+    _joinVault(_nftAmount, user, exactShmonOut);
+    emit SwapExecuted(
+        user,
+        _startTokenAddr,
+        amounts[0],
+        erc20Address,
+        exactShmonOut,
+        _slippageBps
+    );
+}
+
+function _joinVault(uint256 _nftAmount, address user, uint256 amount) internal {
+    require(getState() == 0, "Waiting period");
+    require(user != address(0), "Invalid user");
+    require(
+        getNftCount() + _nftAmount <= TimeNft(nftAddress).nftLimit(),
+        "Exceeds NFT limit"
+    );
+    require(amount == _nftAmount * nftPrice, "Amount mismatch");
+    require(_nftAmount <= nftLimitPerAddress, "Cannot mint more");
+    
+    // Use SHMON already in contract
+    IERC20(erc20Address).approve(PartnerContract, amount);
+    
+    (bool success, bytes memory data) = PartnerContract.call(
+        abi.encodeWithSignature("mint(uint256)", amount)
+    );
+    require(success, string(data));
+    
+    TimeNft(nftAddress).safeMint(user, _nftAmount);
+    activeFunds += amount;
+    totalFunds += amount;
+
+    emit VaultJoined(user, amount);
+}
+
+function getInputForExactOutput(
+    uint256 _nftAmount,
+    uint16 _slippageBps,
+    address _startTokenAddr
+) public view returns (uint256) {
+    uint256 exactShmonOut = _nftAmount * nftPrice;
+    
+    address[] memory path = new address[](3);
+    path[0] = _startTokenAddr;
+    path[1] = WETH;
+    path[2] = erc20Address;
+    
+    uint[] memory amounts = router.getAmountsIn(exactShmonOut, path);
+    uint256 expectedInput = amounts[0];
+    
+    // Apply slippage: expectedInput * (10000 + slippageBps) / 10000
+    return expectedInput * (10000 + _slippageBps) / 10000;
+}
+function swapEthAndJoin(
+    uint256 _nftAmount,
+    address user,
+    uint16 _slippageBps // 100 = 1%
+) external payable nonReentrant {
+    require(_nftAmount > 0, "Zero NFT amount");
+    require(user != address(0), "Invalid user");
+    require(_slippageBps <= 1000, "Slippage too high");
+    
+    // 1. Calculate exact SHMON needed
+    uint256 exactShmonOut = _nftAmount * nftPrice;
+    
+    // 2. Get max ETH input with slippage
+    uint256 maxEthIn = getEthInputForExactOutput(_nftAmount, _slippageBps);
+    require(msg.value >= maxEthIn, "Insufficient ETH sent");
+    
+    // 3. Execute swap directly from ETH to SHMON (no WETH wrapping needed)
+    address[] memory path = new address[](2);
+    path[0] = WETH; // Router automatically wraps ETH to WETH
+    path[1] = erc20Address; // SHMON
+    
+    uint[] memory amounts = router.swapETHForExactTokens{value: maxEthIn}(
+        exactShmonOut,
+        path,
+        address(this), // Send SHMON to contract
+        block.timestamp + 300
+    );
+    
+    // 4. Refund unused ETH (swapETHForExactTokens automatically refunds excess ETH)
+    uint256 ethUsed = amounts[0];
+    if (msg.value > ethUsed) {
+        payable(user).transfer(msg.value - ethUsed);
+    }
+    
+    // 5. Deposit to vault
+    _joinVault(_nftAmount, user, exactShmonOut);
+    
+    emit EthSwapExecuted(
+        user,
+        ethUsed,
+        exactShmonOut,
+        _slippageBps
+    );
+}
+
+function getEthInputForExactOutput(
+    uint256 _nftAmount,
+    uint16 _slippageBps
+) public view returns (uint256) {
+    uint256 exactShmonOut = _nftAmount * nftPrice;
+    
+    address[] memory path = new address[](2);
+    path[0] = WETH;
+    path[1] = erc20Address;
+    
+    uint[] memory amounts = router.getAmountsIn(exactShmonOut, path);
+    uint256 expectedEth = amounts[0];
+    
+    return expectedEth * (10000 + _slippageBps) / 10000;
+}
+
+
+    
+    function getBalanceNft(address _user)external view returns(uint ethAmount,uint nftAmount){
+         nftAmount=TimeNft(nftAddress).balanceOf(_user);
+         ethAmount=nftAmount * nftPrice;
+        return (ethAmount,nftAmount);
+
     }
 
     function automateCoumpounding() public {
